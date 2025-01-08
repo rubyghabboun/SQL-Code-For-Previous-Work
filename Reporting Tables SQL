@@ -1,0 +1,226 @@
+
+--╔════════════════════════════════════════════════════════════════════════════════════════╗--
+--║                                                                                        ║--
+--║                                                                                        ║--    
+--║                                 RPORTING TABLES                                        ║--
+--║                                                                                        ║--
+--║                                                                                        ║--
+--╠════════════════════════════════════════════════════════════════════════════════════════╣--
+
+    ------------------------------------(❁´◡`❁)--------------------------------------------
+
+--╔════════════════════════════════════════════════════════════════════════════════════════╗--
+--║        SUMMARY TABLE OF RETENTION WITH AND WITHOUT TERMED AORs FOR PREV. MONTH         ║--
+--╠════════════════════════════════════════════════════════════════════════════════════════╣--
+
+    -- Calculate churn metrics per carrier group
+   WITH CarrierMetrics AS (
+        SELECT
+            a.carrier_group,
+            SUM(a.retained) AS total_retained,
+            SUM(net_churns) AS net_churns,
+            SUM(CASE WHEN a.agent_status = 'Termd AoR' THEN a.net_churns ELSE 0 END) AS churn_with_termed_aor,
+            SUM(a.net_churns) - SUM(CASE WHEN a.agent_status = 'Termd AoR' THEN a.net_churns ELSE 0 END) AS churn_without_termed_aor,
+            CASE 
+                WHEN SUM(a.retained) > 0 THEN ROUND(100.0 * SUM(a.net_churns) / SUM(a.retained), 1) || '%'
+                ELSE '0%' 
+            END AS net_churn_rate, 
+            CASE 
+                WHEN SUM(a.retained) > 0 THEN ROUND(100.0 * (SUM(a.net_churns) - SUM(CASE WHEN a.agent_status = 'Termd AoR' THEN a.net_churns ELSE 0 END)) / SUM(a.retained), 1) || '%'
+            ELSE '0%' 
+            END AS churn_rate_without_termed_aor  
+        FROM Staging.enhance_health.tmp1 a
+        WHERE a.coverage_month = '12/01/2024'
+                                --BETWEEN (SELECT report_start FROM ReportingDates) AND (SELECT report_end FROM ReportingDates)
+        AND CARRIER_GROUP <> 'Cigna'
+        GROUP BY a.carrier_group
+        
+    ),
+    
+    -- Aggregate totals for the entire population
+    PopulationMetrics AS (
+        SELECT
+            SUM(total_retained) AS grand_total_retained,
+            SUM(net_churns) AS grand_total_net_churned,
+            SUM(churn_with_termed_aor) AS grand_total_churn_with_termed_aor,
+            SUM(churn_without_termed_aor) AS grand_total_churn_without_termed_aor,
+            CASE 
+                WHEN SUM(total_retained) > 0 THEN ROUND(100.0 * SUM(Net_churns) / SUM(total_retained), 1) || '%'
+                ELSE '0%' 
+            END AS grand_total_net_churn_rate,
+            CASE 
+                WHEN SUM(total_retained) > 0 THEN ROUND(100.0 * SUM(churn_without_termed_aor) / SUM(total_retained), 1) || '%'
+                ELSE '0%' 
+            END AS grand_total_churn_without_termed_aor_rate
+        FROM CarrierMetrics
+    )
+    
+    -- Compile final report
+    SELECT
+        c.carrier_group AS "Carrier Group",
+        c.total_retained AS "Retained Members",
+        c.net_churns AS "Net Churned Members",
+        c.churn_with_termed_aor AS "Churns Written by Termd AORs",
+        c.churn_without_termed_aor AS "Churn without Termed AoRs",
+        c.net_churn_rate AS "Net Churn %",
+        c.churn_rate_without_termed_aor AS "Churn % Without Termed AoRs"
+    FROM CarrierMetrics c
+    WHERE total_retained  > 0 
+    UNION ALL
+    
+    SELECT
+        'Grand Total' AS "Carrier Group",
+        p.grand_total_retained AS "Retained Members",
+        p.grand_total_net_churned AS "Net Churned Members",
+        p.grand_total_churn_with_termed_aor AS "Termed AoRs Churned Members",
+        p.grand_total_churn_without_termed_aor AS "Churn without Termed AoRs",
+        p.grand_total_net_churn_rate AS "Net Churn %",
+        p.grand_total_churn_without_termed_aor_rate AS "Churn % Without Termed AoRs"
+    FROM PopulationMetrics p
+    WHERE p.grand_total_retained  > 0 
+   ORDER BY "Retained Members" DESC
+   ;
+
+        
+--╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝--
+
+    ------------------------------------(❁´◡`❁)--------------------------------------------
+
+--╔═══════════════════════════════════════════════════════════════════════════════════════════════════╗--
+--║         Compares carriers retention for current month and previous month               ║--
+--╠═══════════════════════════════════════════════════════════════════════════════════════════════════╣--
+    
+    
+    -- WITH ReportingDates AS (
+    --     SELECT 
+    --         DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') AS report_start,
+    --         DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 day' AS report_end,
+    --         DATE_TRUNC('month', CURRENT_DATE - INTERVAL '2 month') AS previous_month_start,
+    --         DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') - INTERVAL '1 day' AS previous_month_end
+    --     ),
+    
+    -- Calculate churn metrics for the current reporting month
+   with CarrierMetrics AS (
+        SELECT
+            a.carrier_group,
+            SUM(a.retained) AS total_retained,
+            SUM(net_churns) AS net_churns,
+            CASE 
+                WHEN SUM(a.retained) > 0 THEN ROUND(100.0 * SUM(a.net_churns) / SUM(a.retained), 1)
+                ELSE 0 
+            END AS net_churn_rate
+        FROM Staging.enhance_health.tmp1 a
+        WHERE a.coverage_month = '11/01/2024'
+                                -- a.coverage_month BETWEEN (SELECT report_start FROM ReportingDates) AND (SELECT report_end FROM ReportingDates)
+        AND RETAINED > 0 AND CARRIER_GROUP <> 'Cigna'
+        GROUP BY a.carrier_group
+    ),
+    
+    -- Calculate churn metrics for the previous month
+    PreviousMonthMetrics AS (
+        SELECT
+            a.carrier_group,
+            CASE 
+                WHEN SUM(a.retained) > 0 THEN ROUND(100.0 * SUM(a.net_churns) / SUM(a.retained), 1)
+                ELSE 0 
+            END AS previous_month_net_churn_rate
+        FROM Staging.enhance_health.tmp1 a
+        WHERE a.coverage_month = '10/01/2024'
+                                        -- a.coverage_month BETWEEN (SELECT previous_month_start FROM ReportingDates) AND (SELECT previous_month_end FROM ReportingDates)
+        GROUP BY a.carrier_group
+    ),
+    
+    -- Calculate YTD metrics for the current reporting month
+    YTDMetrics AS (
+        SELECT
+            a.carrier_group,
+            CASE 
+                WHEN SUM(a.retained) > 0 THEN ROUND(100.0 * SUM(a.net_churns) / SUM(a.retained), 1)
+                ELSE 0 
+            END AS ytd_net_churn_rate
+        FROM Staging.enhance_health.tmp1 a
+        WHERE a.coverage_month >= '01/01/2024'
+        and a.coverage_month <= '11/01/2024'
+                                    --a.coverage_month <= (SELECT report_end FROM ReportingDates)
+        GROUP BY a.carrier_group
+    ),
+    
+    -- Calculate YTD metrics for the previous month
+    PreviousYTDMetrics AS (
+        SELECT
+            a.carrier_group,
+            CASE 
+                WHEN SUM(a.retained) > 0 THEN ROUND(100.0 * SUM(a.net_churns) / SUM(a.retained), 1)
+                ELSE 0 
+            END AS previous_ytd_net_churn_rate
+        FROM Staging.enhance_health.tmp1 a
+        WHERE a.coverage_month >= '01/01/2024'
+        and a.coverage_month <= '10/01/2024'
+                                    --a.coverage_month <= (SELECT report_end FROM ReportingDates)
+        GROUP BY a.carrier_group
+    ),
+    
+    -- Calculate grand totals
+    GrandTotals AS (
+        SELECT
+            'Grand Total' AS carrier_group,
+            SUM(c.total_retained) AS total_retained,
+            SUM(c.net_churns) AS net_churns,
+            CASE 
+                WHEN SUM(c.total_retained) > 0 THEN ROUND(100.0 * SUM(c.net_churns) / SUM(c.total_retained), 1)
+                ELSE 0
+            END AS net_churn_rate,
+            CASE 
+                WHEN SUM(c.total_retained) > 0 THEN ROUND(SUM(y.ytd_net_churn_rate * c.total_retained) / SUM(c.total_retained), 1)
+                ELSE 0
+            END AS ytd_net_churn_rate,
+            CASE 
+                WHEN SUM(c.total_retained) > 0 THEN ROUND(SUM(p.previous_month_net_churn_rate * c.total_retained) / SUM(c.total_retained), 1)
+                ELSE 0
+            END AS previous_month_net_churn_rate,
+            CASE 
+                WHEN SUM(c.total_retained) > 0 THEN ROUND(SUM(py.previous_ytd_net_churn_rate * c.total_retained) / SUM(c.total_retained), 1)
+                ELSE 0
+            END AS previous_ytd_net_churn_rate
+        FROM CarrierMetrics c
+        LEFT JOIN YTDMetrics y ON c.carrier_group = y.carrier_group
+        LEFT JOIN PreviousMonthMetrics p ON c.carrier_group = p.carrier_group
+        LEFT JOIN PreviousYTDMetrics py ON c.carrier_group = py.carrier_group
+    )
+    
+    -- Combine all metrics into the final report
+    SELECT
+        c.carrier_group AS "Carrier Group",
+        c.total_retained AS "Retained Members",
+        c.net_churns AS "Net Churned Members",
+        CONCAT(y.ytd_net_churn_rate, '%') AS "YTD Net Churn %",  
+        CONCAT(py.previous_ytd_net_churn_rate, '%') AS "YTD Net Churn % 'Previous Month'",
+        CONCAT(ROUND(y.ytd_net_churn_rate - py.previous_ytd_net_churn_rate, 1), '%') AS "YTD Net Churn Change",
+        CONCAT(c.net_churn_rate, '%') AS "Net Churn %",
+        CONCAT(p.previous_month_net_churn_rate, '%') AS "Net Churn % 'Previous Month'",
+        CONCAT(ROUND(c.net_churn_rate - p.previous_month_net_churn_rate, 1), '%') AS "Net Churn % Change"
+    FROM CarrierMetrics c
+    LEFT JOIN PreviousMonthMetrics p ON c.carrier_group = p.carrier_group
+    LEFT JOIN YTDMetrics y ON c.carrier_group = y.carrier_group
+    LEFT JOIN PreviousYTDMetrics py ON c.carrier_group = py.carrier_group
+    
+    UNION ALL
+    
+    SELECT
+        g.carrier_group AS "Carrier Group",
+        g.total_retained AS "Retained Members",
+        g.net_churns AS "Net Churned Members",
+        CONCAT(g.ytd_net_churn_rate, '%') AS "YTD Net Churn %",  
+        CONCAT(g.previous_ytd_net_churn_rate, '%') AS "YTD Net Churn % 'Previous Month'",
+        CONCAT(ROUND(g.ytd_net_churn_rate - g.previous_ytd_net_churn_rate, 1), '%') AS "YTD Net Churn Change",
+        CONCAT(g.net_churn_rate, '%') AS "Net Churn %",
+        CONCAT(g.previous_month_net_churn_rate, '%') AS "Net Churn % 'Previous Month'",
+        CONCAT(ROUND(g.net_churn_rate - g.previous_month_net_churn_rate, 1), '%') AS "Net Churn % Change"
+    FROM GrandTotals g
+    ORDER BY "Retained Members" DESC;
+    
+
+
+--╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝--
+
+    ------------------------------------(❁´◡`❁)--------------------------------------------

@@ -1,0 +1,247 @@
+--- STEP 1
+// CREATE BASE TABLE FROM APD AND ADC
+
+create or replace TEMPORARY table data as
+    select
+        date_trunc('month',to_date(c.original_date_enrolled)) as original_month_sold
+        , c.coverage_month
+        , c.eh_id
+        , c.retained
+        , c.submission
+        , COALESCE(CASE WHEN LEAD(c.retained) OVER (PARTITION BY c.eh_id ORDER BY c.coverage_month) > 0 AND (c.retained = 0 OR c.retained IS NULL) THEN LEAD(c.retained) OVER (PARTITION BY c.eh_id ORDER BY c.coverage_month) END,0) AS recaptured
+        , COALESCE(case when lead(c.retained) over (partition by c.eh_id order by c.coverage_month) = 0 and c.retained > 0 then c.retained end,0) as churned_this_month
+        , c.carrier_group
+        , carrier_unique_id
+        , apd.EH_APPLICATION_Id
+        , apd.first_organization_name
+        , apd.state
+        , apd.county
+        , apd.ffm_application_id
+        , apd.first_commission_type
+          -- Add the remaining columns from ACA_DIRECT_CHURN and other data sources
+        , c.month_number  -- Added from ACA_DIRECT_CHURN
+        , c.owning_application
+        , c.owning_date_enrolled
+        , c.carrier_effective
+        , c.adjusted_carrier_effective
+        , c.carrier_term
+        , c.carrier_count
+        , c.annual_income
+        , c.commission_type
+        , c.first_agent_type
+        , c.ORIGINAL_RETREAVER_VENDOR
+        , c.ORIGINAL_EFFECTIVE_DATE
+        , c.FIRST_AGENT
+    from churn_details c
+    left join policy_details apd
+        on apd.eh_application_id = owning_application
+    ;
+
+
+
+-- STEP 2 
+// Creating temp tbl for documents expired 
+
+create or replace temporary table tmp_qa as
+select
+    original_month_sold
+    , coverage_month
+    , carrier_unique_id
+    , d.EH_APPLICATION_Id
+    , d.eh_id 
+    , carrier_group
+    , DUE_DATE
+    , case when churned_this_month > 0 then carrier_unique_id end as churn_policies_stg
+    , case when dmi.ffm_application_id is not null and due_date < coverage_month then carrier_unique_id end as docs_expired_stg
+    
+from data d
+left join docs_historical dmi
+    on d.ffm_application_id = dmi.ffm_application_id
+    and dmi.document_status in ('Action Needed','Additional Documentation Required','Expired')
+
+where coverage_month >= '2024-01-01' -- docs data only for Jan onward -- JET docs
+    and coverage_month <= current_date
+    and churn_policies_stg is not null
+order by original_month_sold, coverage_month
+;
+
+   
+-- STEP 3
+// Removeing duplicates by picking first occurance for the merge to work.
+
+CREATE OR REPLACE TEMPORARY TABLE tmp_qa_deduped AS
+WITH ranked_qa AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY original_month_sold, eh_id, coverage_month, carrier_group, carrier_unique_id, EH_APPLICATION_Id
+            ORDER BY DUE_DATE 
+        ) AS rn
+    FROM tmp_qa
+)
+SELECT
+    original_month_sold,
+    coverage_month,
+    carrier_group,
+    carrier_unique_id,
+    eh_id,
+    EH_APPLICATION_Id,
+    churn_policies_stg,
+    docs_expired_stg,
+  
+FROM ranked_qa
+WHERE rn = 1;
+
+
+-- STEP 4
+// Merging tmp_qa with main data table 
+
+CREATE OR REPLACE TEMPORARY TABLE data2 AS
+SELECT
+    d.*,
+    qa_deduped.churn_policies_stg,
+    qa_deduped.docs_expired_stg,
+   
+FROM data d
+LEFT JOIN tmp_qa_deduped qa_deduped
+    ON d.original_month_sold = qa_deduped.original_month_sold
+    AND d.coverage_month = qa_deduped.coverage_month
+    AND d.carrier_group = qa_deduped.carrier_group
+    AND d.eh_id = qa_deduped.eh_id
+   ;
+
+
+-- STEP 5
+//  Adding the churn no docs data
+
+CREATE OR REPLACE TEMPORARY TABLE data3 AS
+SELECT
+    data2.*
+    , min(case when dmi.document_name is not null then 1 end) as requires_docs
+     -- The following are the columns to be added from the historical data
+
+FROM data2
+LEFT JOIN docs_historical dmi
+    ON data2.ffm_application_id = dmi.ffm_application_id
+    AND dmi.document_name IS NOT NULL
+GROUP BY 
+     data2.original_month_sold
+    , data2.coverage_month
+    , data2.eh_id
+    , data2.carrier_unique_id
+    , data2.retained
+    , data2.recaptured
+    , data2.churned_this_month
+    , data2.carrier_group
+    , data2.first_organization_name
+    , data2.state
+    , data2.county
+    , data2.submission -- Including submission in GROUP BY
+    , data2.churn_policies_stg
+    , data2.docs_expired_stg
+    , DATA2.EH_APPLICATION_ID
+    , DATA2.ffm_APPLICATION_ID
+    , DATA2.month_number
+    , DATA2.owning_application
+    , DATA2.owning_date_enrolled
+    , DATA2.carrier_effective
+    , DATA2.adjusted_carrier_effective
+    , DATA2.carrier_term
+    , DATA2.carrier_count
+    , DATA2.annual_income
+    , DATA2.commission_type
+    , DATA2.first_agent_type
+    , DATA2.first_commission_type
+    , DATA2.ORIGINAL_RETREAVER_VENDOR
+    , DATA2.ORIGINAL_EFFECTIVE_DATE
+   , DATA2.FIRST_AGENT
+ ;
+
+
+
+
+--------------------------------------------
+
+-- // FINAL STEP TO CREATE MAIN DATASET
+
+
+CREATE OR REPLACE TABLE ACA_Full_Executive_Data AS
+SELECT
+    data3.*,
+     -- The following are the columns to be added from the historical data
+    hist.original_licensing_source,
+    hist.owning_licensing_source,
+    hist.original_agent_type,
+    hist.original_direct_tld_vendor,
+    hist.original_agent,
+    hist.original_county,
+    hist.original_state,
+    hist.run_date
+FROM data3
+LEFT JOIN original_enrollment_hist hist
+    ON hist.eh_id = data3.eh_id
+    AND hist.coverage_month = data3.coverage_month;
+
+
+
+
+--------------------------------------------
+
+-- FINAL STEP TO CREATE AGGRIGATED  DATASET
+// creating the combined aggrigated data "carrier_downline" alternative.
+
+
+CREATE OR REPLACE TABLE enhance_health.reporting.ACA_RETENTION_DASHBOARD AS
+SELECT
+    SYSDATE() AS run_date,
+    original_month_sold,
+    original_licensing_source,
+    carrier_group,
+    first_organization_name,
+    first_commission_type,
+    coverage_month,
+    state,
+    county,
+    ORIGINAL_RETREAVER_VENDOR,
+   month_number,
+    SUM(retained) AS expected_members,
+    SUM(recaptured) AS recaptured_members,
+    SUM(churned_this_month) AS churn_in_month_members,
+    COALESCE(SUM(churned_this_month) / NULLIF(SUM(retained), 0), 0) AS churn_in_month_rate_members,
+    COUNT_IF(retained > 0) AS expected_policies,
+    COUNT_IF(recaptured > 0) AS recaptured_policies,
+    COUNT_IF(churned_this_month > 0) AS churn_in_month_policies,
+    COALESCE(COUNT_IF(churned_this_month > 0) / NULLIF(COUNT_IF(retained > 0), 0), 0) AS churn_in_month_rate_policies,
+    CASE
+        WHEN coverage_month >= '2024-01-01' THEN COUNT(DISTINCT churn_policies_stg)
+        ELSE NULL
+    END AS churn_policies,
+    CASE
+        WHEN coverage_month >= '2024-01-01' THEN COUNT(DISTINCT docs_expired_stg)
+        ELSE NULL
+    END AS docs_expired,
+    CASE
+        WHEN coverage_month >= '2024-01-01' THEN SUM(CASE WHEN requires_docs IS NOT NULL THEN retained END)
+        ELSE NULL
+    END AS expected_members_with_docs,
+    SUM(churned_this_month) AS churned_this_month_members,
+    CASE
+        WHEN coverage_month >= '2024-01-01' THEN SUM(CASE WHEN requires_docs IS NOT NULL THEN churned_this_month END)
+        ELSE NULL
+    END AS churned_with_docs_members,
+        SUM(submission) AS submission
+FROM ACA_Full_Executive_Data
+GROUP BY
+    original_month_sold,
+    ORIGINAL_LICENSING_SOURCE,
+    carrier_group,
+    first_organization_name,
+    coverage_month,
+    state,
+    first_commission_type,
+    county, 
+    ORIGINAL_RETREAVER_VENDOR
+   , month_number
+   ;
+
+
